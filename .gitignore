@@ -1,0 +1,15 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.env
+
+# Claude Code local session state - not project source
+.claude/
+
+# Stray debug/log output from local runs
+*.log
+
+# Node/Vite frontend (react-ui/) build & dependency output
+react-ui/node_modules/
+react-ui/dist/

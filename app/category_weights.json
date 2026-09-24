@@ -1,0 +1,8 @@
+{
+  "_comment": "Per-category weighting for the value-score ranker. Weights must sum to 1.0. Add a category key that matches how you phrase searches for it; unmatched queries fall back to 'default'.",
+  "default": { "price": 0.5, "rating": 0.35, "reviews": 0.15 },
+  "headphones": { "price": 0.4, "rating": 0.45, "reviews": 0.15 },
+  "laptop": { "price": 0.35, "rating": 0.4, "reviews": 0.25 },
+  "phone": { "price": 0.35, "rating": 0.4, "reviews": 0.25 },
+  "smartphone": { "price": 0.35, "rating": 0.4, "reviews": 0.25 }
+}

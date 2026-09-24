@@ -1,0 +1,10 @@
+{
+  "description": "Enhance your shopping experience with a personalized app that curates products based on your preferences, making online shopping efficient and enjoyable.",
+  "robots": {
+    "index": false
+  },
+  "accessibility": {
+    "addBypassLinks": false,
+    "ignoreReducedMotion": false
+  }
+}
