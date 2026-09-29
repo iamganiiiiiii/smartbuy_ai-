@@ -1,3 +1,17 @@
+const TOKEN_KEY = "smartbuy_token";
+
+const authView = document.getElementById("auth-view");
+const appView = document.getElementById("app-view");
+const signupForm = document.getElementById("signup-form");
+const loginForm = document.getElementById("login-form");
+const showLoginLink = document.getElementById("show-login");
+const showSignupLink = document.getElementById("show-signup");
+const authStatusEl = document.getElementById("auth-status");
+const accountInfoEl = document.getElementById("account-info");
+const logoutLink = document.getElementById("logout-link");
+const upgradePanel = document.getElementById("upgrade-panel");
+const subscribeButton = document.getElementById("subscribe-button");
+
 const form = document.getElementById("search-form");
 const queryInput = document.getElementById("query");
 const statusEl = document.getElementById("status");
@@ -6,6 +20,139 @@ const button = form.querySelector("button");
 
 const PLACEHOLDER_IMG =
   "data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='200' height='200'%3E%3Crect width='200' height='200' fill='%23272b33'/%3E%3Ctext x='50%25' y='50%25' fill='%239aa0a6' font-family='sans-serif' font-size='14' text-anchor='middle' dy='.3em'%3ENo image%3C/text%3E%3C/svg%3E";
+
+function getToken() {
+  return localStorage.getItem(TOKEN_KEY);
+}
+
+function setToken(token) {
+  localStorage.setItem(TOKEN_KEY, token);
+}
+
+function clearToken() {
+  localStorage.removeItem(TOKEN_KEY);
+}
+
+async function refreshAccount() {
+  const token = getToken();
+  if (!token) {
+    authView.classList.remove("hidden");
+    appView.classList.add("hidden");
+    return;
+  }
+
+  const res = await fetch("/api/auth/me", {
+    headers: { Authorization: `Bearer ${token}` },
+  });
+
+  if (!res.ok) {
+    clearToken();
+    authView.classList.remove("hidden");
+    appView.classList.add("hidden");
+    return;
+  }
+
+  const me = await res.json();
+  authView.classList.add("hidden");
+  appView.classList.remove("hidden");
+
+  const remaining = Math.max(0, me.free_trial_limit - me.trial_searches_used);
+  accountInfoEl.textContent =
+    me.subscription_status === "active"
+      ? `${me.email} · Subscribed`
+      : `${me.email} · ${remaining} free search${remaining === 1 ? "" : "es"} left`;
+
+  upgradePanel.classList.toggle("hidden", me.subscription_status === "active" || remaining > 0);
+}
+
+signupForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  await authenticate("/api/auth/signup", {
+    email: document.getElementById("signup-email").value.trim(),
+    password: document.getElementById("signup-password").value,
+  });
+});
+
+loginForm.addEventListener("submit", async (e) => {
+  e.preventDefault();
+  await authenticate("/api/auth/login", {
+    email: document.getElementById("login-email").value.trim(),
+    password: document.getElementById("login-password").value,
+  });
+});
+
+async function authenticate(endpoint, body) {
+  authStatusEl.textContent = "";
+  try {
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    });
+    const data = await res.json();
+    if (!res.ok) {
+      authStatusEl.textContent = data?.detail || "Something went wrong.";
+      return;
+    }
+    setToken(data.token);
+    await refreshAccount();
+  } catch (err) {
+    authStatusEl.textContent = "Request failed: " + err.message;
+  }
+}
+
+showLoginLink.addEventListener("click", (e) => {
+  e.preventDefault();
+  signupForm.classList.add("hidden");
+  loginForm.classList.remove("hidden");
+  showLoginLink.classList.add("hidden");
+  showSignupLink.classList.remove("hidden");
+});
+
+showSignupLink.addEventListener("click", (e) => {
+  e.preventDefault();
+  loginForm.classList.add("hidden");
+  signupForm.classList.remove("hidden");
+  showSignupLink.classList.add("hidden");
+  showLoginLink.classList.remove("hidden");
+});
+
+logoutLink.addEventListener("click", async (e) => {
+  e.preventDefault();
+  const token = getToken();
+  if (token) {
+    await fetch("/api/auth/logout", {
+      method: "POST",
+      headers: { Authorization: `Bearer ${token}` },
+    }).catch(() => {});
+  }
+  clearToken();
+  await refreshAccount();
+});
+
+subscribeButton.addEventListener("click", async () => {
+  const token = getToken();
+  const res = await fetch("/api/billing/create-subscription", {
+    method: "POST",
+    headers: { Authorization: `Bearer ${token}` },
+  });
+  const data = await res.json();
+  if (!res.ok) {
+    alert(data?.detail || "Could not start checkout.");
+    return;
+  }
+
+  const checkout = new Razorpay({
+    key: data.key_id,
+    subscription_id: data.subscription_id,
+    name: "SmartBuy AI",
+    description: "SmartBuy AI subscription",
+    handler: () => {
+      refreshAccount();
+    },
+  });
+  checkout.open();
+});
 
 form.addEventListener("submit", async (e) => {
   e.preventDefault();
@@ -19,7 +166,10 @@ form.addEventListener("submit", async (e) => {
   try {
     const res = await fetch("/api/search", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: {
+        "Content-Type": "application/json",
+        Authorization: `Bearer ${getToken()}`,
+      },
       body: JSON.stringify({ query }),
     });
 
@@ -31,6 +181,13 @@ form.addEventListener("submit", async (e) => {
       data = null;
     }
 
+    if (res.status === 402) {
+      statusEl.textContent = "";
+      resultEl.textContent = "";
+      upgradePanel.classList.remove("hidden");
+      return;
+    }
+
     if (!res.ok) {
       statusEl.textContent = "";
       resultEl.textContent = data?.detail || rawBody || "Something went wrong.";
@@ -39,6 +196,7 @@ form.addEventListener("submit", async (e) => {
 
     statusEl.textContent = "";
     renderResult(data);
+    refreshAccount();
   } catch (err) {
     statusEl.textContent = "";
     resultEl.textContent = "Request failed: " + err.message;
@@ -46,6 +204,8 @@ form.addEventListener("submit", async (e) => {
     button.disabled = false;
   }
 });
+
+refreshAccount();
 
 function renderResult(data) {
   resultEl.innerHTML = "";

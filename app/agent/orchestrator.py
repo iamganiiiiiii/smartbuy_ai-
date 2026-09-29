@@ -12,6 +12,7 @@ credit card - instead of a paid LLM API.
 from google import genai
 from google.genai import types
 
+from app import guardrails
 from app.agent.prompts import ACTIVE_SYSTEM_PROMPT
 from app.agent.tools import TOOL_SCHEMAS, dispatch
 from app.config import settings
@@ -37,12 +38,17 @@ class AgentRunResult:
         best_listing: dict | None = None,
         other_listings: list[dict] | None = None,
         alternatives: list[dict] | None = None,
+        flags: list[str] | None = None,
     ):
         self.final_text = final_text
         self.trace = trace
         self.best_listing = best_listing
         self.other_listings = other_listings or []
         self.alternatives = alternatives or []
+        # Guardrail signals raised during this run (e.g. budget filtering emptied
+        # results, output-grounding found an unmatched price) - logged as an audit
+        # trail by the caller, never used to silently alter what the user sees.
+        self.flags = flags or []
 
 
 async def run_agent(user_message: str) -> AgentRunResult:
@@ -58,6 +64,7 @@ async def run_agent(user_message: str) -> AgentRunResult:
     best_listing: dict | None = None
     other_listings: list[dict] = []
     alternatives: list[dict] = []
+    flags: list[str] = []
 
     for turn in range(MAX_TURNS):
         response = await client.aio.models.generate_content(
@@ -75,12 +82,16 @@ async def run_agent(user_message: str) -> AgentRunResult:
 
         function_calls = response.function_calls
         if not function_calls:
+            known_prices = {l["price"] for l in ([best_listing] if best_listing else []) + other_listings}
+            known_prices |= {a["price"] for a in alternatives}
+            flags += guardrails.check_output_grounding(text, known_prices)
             return AgentRunResult(
                 final_text=text,
                 trace=trace,
                 best_listing=best_listing,
                 other_listings=other_listings,
                 alternatives=alternatives,
+                flags=flags,
             )
 
         function_response_parts = []
@@ -91,6 +102,8 @@ async def run_agent(user_message: str) -> AgentRunResult:
             trace.append({"role": "tool_result", "tool": call.name, "result": result})
             function_response_parts.append(types.Part.from_function_response(name=call.name, response=result))
 
+            if result.get("flags"):
+                flags += result["flags"]
             if call.name == "search_products" and result.get("best_listing"):
                 best_listing = result["best_listing"]
                 other_listings = result.get("other_listings") or []
@@ -105,4 +118,5 @@ async def run_agent(user_message: str) -> AgentRunResult:
         best_listing=best_listing,
         other_listings=other_listings,
         alternatives=alternatives,
+        flags=flags,
     )

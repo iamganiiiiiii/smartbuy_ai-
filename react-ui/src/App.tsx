@@ -34,10 +34,46 @@ interface SearchResponse {
   trace: unknown[]
 }
 
-async function searchProducts(query: string): Promise<SearchResponse> {
+interface Me {
+  email: string
+  member_since: string
+  trial_searches_used: number
+  free_trial_limit: number
+  subscription_status: 'none' | 'active' | 'cancelled'
+  subscription_renews_at: string | null
+  price_label: string
+}
+
+// Thrown when /api/search returns 402 (free trial used up, no active
+// subscription) - kept distinct from a generic Error so the UI can show an
+// upgrade prompt instead of a "search failed" message.
+class PaywallError extends Error {}
+
+interface RazorpayCheckoutOptions {
+  key: string
+  subscription_id: string
+  name: string
+  description?: string
+  handler: () => void
+}
+declare global {
+  interface Window {
+    Razorpay?: new (options: RazorpayCheckoutOptions) => { open: () => void }
+  }
+}
+
+const TOKEN_STORAGE_KEY = 'smartbuy_token'
+
+async function fetchMe(token: string): Promise<Me | null> {
+  const res = await fetch(`${API_BASE}/api/auth/me`, { headers: { Authorization: `Bearer ${token}` } })
+  if (!res.ok) return null
+  return res.json()
+}
+
+async function searchProducts(query: string, token: string): Promise<SearchResponse> {
   const res = await fetch(`${API_BASE}/api/search`, {
     method: 'POST',
-    headers: { 'Content-Type': 'application/json' },
+    headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
     body: JSON.stringify({ query }),
   })
 
@@ -49,8 +85,12 @@ async function searchProducts(query: string): Promise<SearchResponse> {
     data = null
   }
 
+  const detail = data && typeof data === 'object' && 'detail' in data ? String((data as { detail: unknown }).detail) : null
+
+  if (res.status === 402) {
+    throw new PaywallError(detail || 'Free trial used up.')
+  }
   if (!res.ok) {
-    const detail = data && typeof data === 'object' && 'detail' in data ? String((data as { detail: unknown }).detail) : null
     throw new Error(detail || rawBody || `Search failed (${res.status})`)
   }
 
@@ -163,12 +203,285 @@ export default function App() {
   const [agentStep, setAgentStep] = useState(0)
   const [searchResult, setSearchResult] = useState<SearchResponse | null>(null)
   const [errorMessage, setErrorMessage] = useState<string | null>(null)
+  const [paywalled, setPaywalled] = useState(false)
   const [selected, setSelected] = useState<DisplayProduct | null>(null)
   const [wishlist, setWishlist] = useState<string[]>([])
   const [filter, setFilter] = useState<FilterTab>('all')
   const [sortBy, setSortBy] = useState<SortKey>('relevance')
   const inputRef = useRef<HTMLInputElement>(null)
   const resultsRef = useRef<HTMLDivElement>(null)
+
+  // ── Auth ──────────────────────────────────────────────────────────────────
+  const [token, setTokenState] = useState<string | null>(() => localStorage.getItem(TOKEN_STORAGE_KEY))
+  const [me, setMe] = useState<Me | null>(null)
+  const [authChecked, setAuthChecked] = useState(false)
+  const [authMode, setAuthMode] = useState<'login' | 'signup'>('signup')
+  const [authEmail, setAuthEmail] = useState('')
+  const [authPassword, setAuthPassword] = useState('')
+  const [authError, setAuthError] = useState<string | null>(null)
+  const [authSubmitting, setAuthSubmitting] = useState(false)
+  const [subscribing, setSubscribing] = useState(false)
+  const [cancelling, setCancelling] = useState(false)
+  const [accountPanelOpen, setAccountPanelOpen] = useState(false)
+  const accountPanelRef = useRef<HTMLDivElement>(null)
+
+  const [forgotMode, setForgotMode] = useState(false)
+  const [forgotEmail, setForgotEmail] = useState('')
+  const [forgotSubmitting, setForgotSubmitting] = useState(false)
+  const [forgotSent, setForgotSent] = useState(false)
+
+  const [resetToken, setResetToken] = useState<string | null>(() => new URLSearchParams(window.location.search).get('reset_token'))
+  const [resetNewPassword, setResetNewPassword] = useState('')
+  const [resetSubmitting, setResetSubmitting] = useState(false)
+  const [resetError, setResetError] = useState<string | null>(null)
+  const [resetDone, setResetDone] = useState(false)
+
+  const [settingsOpen, setSettingsOpen] = useState(false)
+  const [currentPassword, setCurrentPassword] = useState('')
+  const [newPassword, setNewPassword] = useState('')
+  const [changePasswordError, setChangePasswordError] = useState<string | null>(null)
+  const [changePasswordSuccess, setChangePasswordSuccess] = useState(false)
+  const [changePasswordSubmitting, setChangePasswordSubmitting] = useState(false)
+  const [deleteConfirming, setDeleteConfirming] = useState(false)
+  const [deleting, setDeleting] = useState(false)
+
+  const [listening, setListening] = useState(false)
+
+  const setToken = (t: string | null) => {
+    setTokenState(t)
+    if (t) localStorage.setItem(TOKEN_STORAGE_KEY, t)
+    else localStorage.removeItem(TOKEN_STORAGE_KEY)
+  }
+
+  useEffect(() => {
+    if (!accountPanelOpen) return
+    const onClickOutside = (e: MouseEvent) => {
+      if (accountPanelRef.current && !accountPanelRef.current.contains(e.target as Node)) setAccountPanelOpen(false)
+    }
+    document.addEventListener('mousedown', onClickOutside)
+    return () => document.removeEventListener('mousedown', onClickOutside)
+  }, [accountPanelOpen])
+
+  useEffect(() => {
+    if (!token) {
+      setAuthChecked(true)
+      return
+    }
+    fetchMe(token).then(m => {
+      if (m) setMe(m)
+      else setToken(null)
+      setAuthChecked(true)
+    })
+    // Only re-check on mount - subsequent refreshes happen explicitly after a search or subscribe.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  const handleAuthSubmit = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setAuthError(null)
+    setAuthSubmitting(true)
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/${authMode}`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: authEmail, password: authPassword }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setAuthError(data?.detail || 'Something went wrong.')
+        return
+      }
+      setToken(data.token)
+      const m = await fetchMe(data.token)
+      if (m) setMe(m)
+    } catch (err) {
+      setAuthError(err instanceof Error ? err.message : 'Request failed.')
+    } finally {
+      setAuthSubmitting(false)
+    }
+  }
+
+  const handleLogout = () => {
+    if (token) {
+      fetch(`${API_BASE}/api/auth/logout`, { method: 'POST', headers: { Authorization: `Bearer ${token}` } }).catch(() => {})
+    }
+    setToken(null)
+    setMe(null)
+    setPhase('idle')
+    setSearchResult(null)
+    setErrorMessage(null)
+    setPaywalled(false)
+    setSelected(null)
+    setAccountPanelOpen(false)
+  }
+
+  const handleSubscribe = async () => {
+    if (!token) return
+    setSubscribing(true)
+    try {
+      const res = await fetch(`${API_BASE}/api/billing/create-subscription`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        alert(data?.detail || 'Could not start checkout.')
+        return
+      }
+      if (!window.Razorpay) {
+        alert('Payment widget failed to load - please refresh and try again.')
+        return
+      }
+      const checkout = new window.Razorpay({
+        key: data.key_id,
+        subscription_id: data.subscription_id,
+        name: 'SmartBuy AI',
+        description: 'SmartBuy AI subscription',
+        handler: async () => {
+          const m = await fetchMe(token)
+          if (m) setMe(m)
+          setPaywalled(false)
+        },
+      })
+      checkout.open()
+    } finally {
+      setSubscribing(false)
+    }
+  }
+
+  const handleCancelSubscription = async () => {
+    if (!token) return
+    setCancelling(true)
+    try {
+      const res = await fetch(`${API_BASE}/api/billing/cancel-subscription`, {
+        method: 'POST',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (res.ok) {
+        const m = await fetchMe(token)
+        if (m) setMe(m)
+      } else {
+        const data = await res.json().catch(() => null)
+        alert(data?.detail || 'Could not cancel subscription.')
+      }
+    } finally {
+      setCancelling(false)
+    }
+  }
+
+  const handleForgotPassword = async (e: React.FormEvent) => {
+    e.preventDefault()
+    setForgotSubmitting(true)
+    try {
+      await fetch(`${API_BASE}/api/auth/forgot-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ email: forgotEmail }),
+      })
+      // Always show success, matching the backend's "don't reveal which emails exist" behavior.
+      setForgotSent(true)
+    } finally {
+      setForgotSubmitting(false)
+    }
+  }
+
+  const handleResetPassword = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!resetToken) return
+    setResetError(null)
+    setResetSubmitting(true)
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/reset-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ token: resetToken, new_password: resetNewPassword }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setResetError(data?.detail || 'This reset link is invalid or has expired.')
+        return
+      }
+      setResetDone(true)
+    } catch (err) {
+      setResetError(err instanceof Error ? err.message : 'Request failed.')
+    } finally {
+      setResetSubmitting(false)
+    }
+  }
+
+  const goToLoginAfterReset = () => {
+    window.history.replaceState({}, '', window.location.pathname)
+    setResetToken(null)
+    setAuthMode('login')
+  }
+
+  const handleChangePassword = async (e: React.FormEvent) => {
+    e.preventDefault()
+    if (!token) return
+    setChangePasswordError(null)
+    setChangePasswordSuccess(false)
+    setChangePasswordSubmitting(true)
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/change-password`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: `Bearer ${token}` },
+        body: JSON.stringify({ current_password: currentPassword, new_password: newPassword }),
+      })
+      const data = await res.json()
+      if (!res.ok) {
+        setChangePasswordError(data?.detail || 'Something went wrong.')
+        return
+      }
+      setChangePasswordSuccess(true)
+      setCurrentPassword('')
+      setNewPassword('')
+    } catch (err) {
+      setChangePasswordError(err instanceof Error ? err.message : 'Request failed.')
+    } finally {
+      setChangePasswordSubmitting(false)
+    }
+  }
+
+  const handleDeleteAccount = async () => {
+    if (!token) return
+    setDeleting(true)
+    try {
+      const res = await fetch(`${API_BASE}/api/auth/account`, {
+        method: 'DELETE',
+        headers: { Authorization: `Bearer ${token}` },
+      })
+      if (res.ok) {
+        setSettingsOpen(false)
+        handleLogout()
+      } else {
+        const data = await res.json().catch(() => null)
+        alert(data?.detail || 'Could not delete account.')
+      }
+    } finally {
+      setDeleting(false)
+    }
+  }
+
+  const startVoiceSearch = () => {
+    const SpeechRecognitionCtor = (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition
+    if (!SpeechRecognitionCtor) {
+      alert('Voice search needs a browser that supports the Web Speech API - try Chrome or Edge.')
+      return
+    }
+    const recognition = new SpeechRecognitionCtor()
+    recognition.lang = 'en-IN'
+    recognition.interimResults = false
+    recognition.maxAlternatives = 1
+    recognition.onresult = (e: any) => {
+      const transcript = e.results[0][0].transcript as string
+      setQuery(transcript)
+      runSearch(transcript)
+    }
+    recognition.onerror = () => setListening(false)
+    recognition.onend = () => setListening(false)
+    setListening(true)
+    recognition.start()
+  }
 
   useEffect(() => {
     if (phase !== 'searching') return
@@ -180,18 +493,22 @@ export default function App() {
   }, [phase])
 
   const runSearch = async (q: string) => {
-    if (!q.trim()) return
+    if (!q.trim() || !token) return
     setErrorMessage(null)
+    setPaywalled(false)
     setSearchResult(null)
     setSelected(null)
     setFilter('all')
     setPhase('searching')
 
     try {
-      const result = await searchProducts(q)
+      const result = await searchProducts(q, token)
       setSearchResult(result)
+      const m = await fetchMe(token)
+      if (m) setMe(m)
     } catch (err) {
-      setErrorMessage(err instanceof Error ? err.message : 'Search failed - please try again.')
+      if (err instanceof PaywallError) setPaywalled(true)
+      else setErrorMessage(err instanceof Error ? err.message : 'Search failed - please try again.')
     } finally {
       setTimeout(() => setPhase('results'), 350)
     }
@@ -203,6 +520,7 @@ export default function App() {
     setPhase('idle')
     setSearchResult(null)
     setErrorMessage(null)
+    setPaywalled(false)
     setSelected(null)
   }
 
@@ -253,7 +571,7 @@ export default function App() {
         </div>
 
         <div className="flex items-center gap-2">
-          {wishlist.length > 0 && (
+          {me && wishlist.length > 0 && (
             <div className="flex items-center gap-1.5 text-xs text-zinc-400 bg-white/5 px-3 py-1.5 rounded-full">
               <svg className="w-3.5 h-3.5 text-pink-400" fill="currentColor" viewBox="0 0 20 20">
                 <path fillRule="evenodd" d="M3.172 5.172a4 4 0 015.656 0L10 6.343l1.172-1.171a4 4 0 115.656 5.656L10 17.657l-6.828-6.829a4 4 0 010-5.656z" clipRule="evenodd" />
@@ -261,12 +579,319 @@ export default function App() {
               {wishlist.length} saved
             </div>
           )}
-          <div className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold text-white" style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}>
-            A
-          </div>
+          {me && (
+            <>
+              <span className="hidden sm:inline text-xs text-zinc-400">
+                {me.subscription_status === 'active' ? 'Subscribed' : `${Math.max(0, me.free_trial_limit - me.trial_searches_used)} free left`}
+              </span>
+              <div className="relative" ref={accountPanelRef}>
+                <button
+                  onClick={() => setAccountPanelOpen(o => !o)}
+                  title={me.email}
+                  className="w-8 h-8 rounded-full flex items-center justify-center text-xs font-bold text-white transition-transform hover:scale-105 active:scale-95"
+                  style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}
+                >
+                  {me.email[0]?.toUpperCase() ?? 'U'}
+                </button>
+
+                {accountPanelOpen && (
+                  <div
+                    className="absolute right-0 top-full mt-2 w-72 rounded-2xl border border-white/8 overflow-hidden z-50 animate-fade-up"
+                    style={{ background: '#0e0e1c', boxShadow: '0 20px 40px rgba(0,0,0,0.45)' }}
+                  >
+                    <div className="p-4 border-b border-white/5 flex items-center gap-3">
+                      <div
+                        className="w-9 h-9 rounded-full flex items-center justify-center text-xs font-bold text-white flex-shrink-0"
+                        style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}
+                      >
+                        {me.email[0]?.toUpperCase() ?? 'U'}
+                      </div>
+                      <div className="min-w-0">
+                        <p className="text-sm font-semibold text-white truncate">{me.email}</p>
+                        <p className="text-xs text-zinc-500">
+                          {me.subscription_status === 'active' ? 'Subscribed' : me.subscription_status === 'cancelled' ? 'Cancelled' : 'Free'}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="p-2">
+                      {me.subscription_status !== 'active' && (
+                        <button
+                          onClick={() => {
+                            setAccountPanelOpen(false)
+                            handleSubscribe()
+                          }}
+                          className="w-full flex items-center gap-2.5 text-left px-3 py-2 rounded-lg text-sm text-white hover:bg-white/5 transition-colors"
+                        >
+                          <svg className="w-4 h-4 flex-shrink-0" style={{ color: '#818cf8' }} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                            <path
+                              strokeLinecap="round"
+                              strokeLinejoin="round"
+                              strokeWidth={1.8}
+                              d="M9.813 15.904L9 18.75l-.813-2.846a4.5 4.5 0 00-3.09-3.09L2.25 12l2.846-.813a4.5 4.5 0 003.09-3.09L9 5.25l.813 2.846a4.5 4.5 0 003.09 3.09L15.75 12l-2.846.813a4.5 4.5 0 00-3.09 3.09z"
+                            />
+                          </svg>
+                          Upgrade plan
+                        </button>
+                      )}
+                      <button
+                        onClick={() => {
+                          setAccountPanelOpen(false)
+                          setSettingsOpen(true)
+                        }}
+                        className="w-full flex items-center gap-2.5 text-left px-3 py-2 rounded-lg text-sm text-zinc-300 hover:bg-white/5 transition-colors"
+                      >
+                        <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth={1.6}
+                            d="M9.594 3.94c.09-.542.56-.94 1.11-.94h2.593c.55 0 1.02.398 1.11.94l.213 1.281c.063.374.313.686.645.87.074.04.147.083.22.127.324.196.72.257 1.075.124l1.217-.456a1.125 1.125 0 011.37.49l1.296 2.247a1.125 1.125 0 01-.26 1.431l-1.003.827c-.293.24-.438.613-.431.992a6.759 6.759 0 010 .255c-.007.378.138.75.43.99l1.005.828c.424.35.534.954.26 1.43l-1.298 2.247a1.125 1.125 0 01-1.369.491l-1.217-.456c-.355-.133-.75-.072-1.076.124a6.57 6.57 0 01-.22.128c-.331.183-.581.495-.644.869l-.213 1.28c-.09.543-.56.941-1.11.941h-2.594c-.55 0-1.02-.398-1.11-.94l-.213-1.281c-.062-.374-.312-.686-.644-.87a6.52 6.52 0 01-.22-.127c-.325-.196-.72-.257-1.076-.124l-1.217.456a1.125 1.125 0 01-1.369-.49l-1.297-2.247a1.125 1.125 0 01.26-1.431l1.004-.827c.292-.24.437-.613.43-.992a6.932 6.932 0 010-.255c.007-.378-.138-.75-.43-.99l-1.004-.828a1.125 1.125 0 01-.26-1.43l1.297-2.247a1.125 1.125 0 011.37-.491l1.216.456c.356.133.751.072 1.076-.124.072-.044.146-.087.22-.128.332-.183.582-.495.644-.869l.214-1.28z"
+                          />
+                          <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.6} d="M15 12a3 3 0 11-6 0 3 3 0 016 0z" />
+                        </svg>
+                        Account settings
+                      </button>
+                      <div className="h-px bg-white/5 my-1" />
+                      <button
+                        onClick={handleLogout}
+                        className="w-full flex items-center gap-2.5 text-left px-3 py-2 rounded-lg text-sm text-zinc-300 hover:bg-white/5 transition-colors"
+                      >
+                        <svg className="w-4 h-4 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                          <path
+                            strokeLinecap="round"
+                            strokeLinejoin="round"
+                            strokeWidth={1.8}
+                            d="M15.75 9V5.25A2.25 2.25 0 0013.5 3h-6a2.25 2.25 0 00-2.25 2.25v13.5A2.25 2.25 0 007.5 21h6a2.25 2.25 0 002.25-2.25V15m3-3l3-3m0 0l-3-3m3 3H9"
+                          />
+                        </svg>
+                        Log out
+                      </button>
+                    </div>
+                  </div>
+                )}
+              </div>
+            </>
+          )}
         </div>
       </nav>
 
+      {/* ── Auth gate ── */}
+      {resetToken ? (
+        <div className="relative flex-1 flex flex-col items-center justify-center px-4 py-16 overflow-hidden animate-fade-up">
+          <div
+            className="pointer-events-none absolute -top-32 left-1/2 -translate-x-1/2 w-[560px] h-[560px] rounded-full opacity-25 blur-3xl"
+            style={{ background: 'radial-gradient(circle, #6366f1, transparent 70%)' }}
+          />
+          <div
+            className="relative w-14 h-14 rounded-2xl flex items-center justify-center mb-6"
+            style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)', boxShadow: '0 10px 30px rgba(99,102,241,0.35)' }}
+          >
+            <svg className="w-7 h-7 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 10-8 0v4h8z" />
+            </svg>
+          </div>
+
+          {resetDone ? (
+            <>
+              <h1 className="relative text-center text-3xl sm:text-4xl font-bold text-white mb-3" style={{ fontFamily: 'Sora, sans-serif' }}>
+                Password updated
+              </h1>
+              <p className="relative text-zinc-500 text-sm mb-8 text-center max-w-sm">You can log in with your new password now.</p>
+              <button
+                onClick={goToLoginAfterReset}
+                className="relative px-5 py-2.5 rounded-xl text-sm font-semibold text-white transition-all hover:brightness-110 hover:-translate-y-0.5 shadow-[0_8px_24px_rgba(99,102,241,0.25)]"
+                style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}
+              >
+                Go to log in
+              </button>
+            </>
+          ) : (
+            <>
+              <h1 className="relative text-center text-3xl sm:text-4xl font-bold text-white mb-3" style={{ fontFamily: 'Sora, sans-serif' }}>
+                Set a new password
+              </h1>
+              <p className="relative text-zinc-500 text-sm mb-8 text-center max-w-sm">Choose a new password for your account.</p>
+              <form onSubmit={handleResetPassword} className="relative w-full max-w-sm space-y-3">
+                <input
+                  type="password"
+                  required
+                  minLength={8}
+                  autoComplete="new-password"
+                  value={resetNewPassword}
+                  onChange={e => setResetNewPassword(e.target.value)}
+                  placeholder="New password (min 8 characters)"
+                  className="w-full rounded-xl border text-white placeholder-zinc-600 text-sm px-4 py-3 outline-none transition-shadow focus:shadow-[0_0_0_3px_rgba(99,102,241,0.25)]"
+                  style={{ background: '#0e0e1c', borderColor: 'rgba(99,102,241,0.25)' }}
+                />
+                {resetError && <p className="text-xs text-red-400">{resetError}</p>}
+                <button
+                  type="submit"
+                  disabled={resetSubmitting}
+                  className="w-full py-3 rounded-xl text-sm font-semibold text-white transition-all hover:brightness-110 hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50 shadow-[0_8px_24px_rgba(99,102,241,0.25)]"
+                  style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}
+                >
+                  {resetSubmitting ? 'Saving…' : 'Save new password'}
+                </button>
+              </form>
+            </>
+          )}
+        </div>
+      ) : !authChecked ? (
+        <div className="flex-1 flex items-center justify-center py-16">
+          <div className="w-6 h-6 rounded-full border-2 border-white/10 animate-spin" style={{ borderTopColor: '#818cf8' }} />
+        </div>
+      ) : !me ? (
+        <div className="relative flex-1 flex flex-col items-center justify-center px-4 py-16 overflow-hidden animate-fade-up">
+          <div
+            className="pointer-events-none absolute -top-32 left-1/2 -translate-x-1/2 w-[560px] h-[560px] rounded-full opacity-25 blur-3xl"
+            style={{ background: 'radial-gradient(circle, #6366f1, transparent 70%)' }}
+          />
+
+          <div
+            className="relative w-14 h-14 rounded-2xl flex items-center justify-center mb-6"
+            style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)', boxShadow: '0 10px 30px rgba(99,102,241,0.35)' }}
+          >
+            <svg className="w-7 h-7 text-white" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2.2} d="M13 10V3L4 14h7v7l9-11h-7z" />
+            </svg>
+          </div>
+
+          <h1 className="relative text-center text-3xl sm:text-4xl font-bold text-white mb-3 leading-tight" style={{ fontFamily: 'Sora, sans-serif' }}>
+            {forgotMode ? 'Reset your password' : authMode === 'signup' ? 'Create your account' : 'Welcome back'}
+          </h1>
+          <p className="relative text-zinc-500 text-sm mb-8 text-center max-w-sm">
+            {forgotMode
+              ? "Enter your email and we'll send you a reset link."
+              : authMode === 'signup'
+                ? 'Sign up to get 5 free searches - then subscribe to keep going.'
+                : 'Log in to keep comparing prices.'}
+          </p>
+
+          {forgotMode ? (
+            forgotSent ? (
+              <p className="relative text-sm text-zinc-400 text-center max-w-sm">
+                If an account exists for that email, a reset link is on its way.
+              </p>
+            ) : (
+              <form onSubmit={handleForgotPassword} className="relative w-full max-w-sm space-y-3">
+                <input
+                  type="email"
+                  required
+                  autoComplete="username"
+                  value={forgotEmail}
+                  onChange={e => setForgotEmail(e.target.value)}
+                  placeholder="Email"
+                  className="w-full rounded-xl border text-white placeholder-zinc-600 text-sm px-4 py-3 outline-none transition-shadow focus:shadow-[0_0_0_3px_rgba(99,102,241,0.25)]"
+                  style={{ background: '#0e0e1c', borderColor: 'rgba(99,102,241,0.25)' }}
+                />
+                <button
+                  type="submit"
+                  disabled={forgotSubmitting}
+                  className="w-full py-3 rounded-xl text-sm font-semibold text-white transition-all hover:brightness-110 hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50 shadow-[0_8px_24px_rgba(99,102,241,0.25)]"
+                  style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}
+                >
+                  {forgotSubmitting ? 'Sending…' : 'Send reset link'}
+                </button>
+              </form>
+            )
+          ) : (
+          <form onSubmit={handleAuthSubmit} className="relative w-full max-w-sm space-y-3">
+            <div className="relative">
+              <div className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-500 pointer-events-none">
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M3 8l7.89 5.26a2 2 0 002.22 0L21 8M5 19h14a2 2 0 002-2V7a2 2 0 00-2-2H5a2 2 0 00-2 2v10a2 2 0 002 2z" />
+                </svg>
+              </div>
+              <input
+                type="email"
+                required
+                autoComplete="username"
+                value={authEmail}
+                onChange={e => setAuthEmail(e.target.value)}
+                placeholder="Email"
+                className="w-full rounded-xl border text-white placeholder-zinc-600 text-sm pl-11 pr-4 py-3 outline-none transition-shadow focus:shadow-[0_0_0_3px_rgba(99,102,241,0.25)]"
+                style={{ background: '#0e0e1c', borderColor: 'rgba(99,102,241,0.25)' }}
+              />
+            </div>
+            <div className="relative">
+              <div className="absolute left-4 top-1/2 -translate-y-1/2 text-zinc-500 pointer-events-none">
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={1.8} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 10-8 0v4h8z" />
+                </svg>
+              </div>
+              <input
+                type="password"
+                required
+                minLength={8}
+                autoComplete={authMode === 'signup' ? 'new-password' : 'current-password'}
+                value={authPassword}
+                onChange={e => setAuthPassword(e.target.value)}
+                placeholder={authMode === 'signup' ? 'Password (min 8 characters)' : 'Password'}
+                className="w-full rounded-xl border text-white placeholder-zinc-600 text-sm pl-11 pr-4 py-3 outline-none transition-shadow focus:shadow-[0_0_0_3px_rgba(99,102,241,0.25)]"
+                style={{ background: '#0e0e1c', borderColor: 'rgba(99,102,241,0.25)' }}
+              />
+            </div>
+            {authMode === 'login' && (
+              <button
+                type="button"
+                onClick={() => {
+                  setForgotMode(true)
+                  setForgotSent(false)
+                  setForgotEmail(authEmail)
+                }}
+                className="text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
+              >
+                Forgot password?
+              </button>
+            )}
+            {authError && (
+              <p className="text-xs text-red-400 flex items-center gap-1.5">
+                <svg className="w-3.5 h-3.5 flex-shrink-0" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 9v3.75m-9.303 3.376c-.866 1.5.217 3.374 1.948 3.374h14.71c1.73 0 2.813-1.874 1.948-3.374L13.949 3.378c-.866-1.5-3.032-1.5-3.898 0L2.697 16.126zM12 15.75h.007v.008H12v-.008z" />
+                </svg>
+                {authError}
+              </p>
+            )}
+            <button
+              type="submit"
+              disabled={authSubmitting}
+              className="w-full py-3 rounded-xl text-sm font-semibold text-white transition-all hover:brightness-110 hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-50 disabled:hover:translate-y-0 shadow-[0_8px_24px_rgba(99,102,241,0.25)]"
+              style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}
+            >
+              {authSubmitting ? (
+                <span className="flex items-center justify-center gap-2">
+                  <span className="w-3.5 h-3.5 rounded-full border-2 border-white/30 animate-spin" style={{ borderTopColor: '#fff' }} />
+                  {authMode === 'signup' ? 'Creating account…' : 'Logging in…'}
+                </span>
+              ) : authMode === 'signup' ? (
+                'Create account'
+              ) : (
+                'Log in'
+              )}
+            </button>
+          </form>
+          )}
+
+          <button
+            onClick={() => {
+              if (forgotMode) {
+                setForgotMode(false)
+                return
+              }
+              setAuthMode(m => (m === 'signup' ? 'login' : 'signup'))
+              setAuthError(null)
+            }}
+            className="relative mt-5 text-xs text-zinc-500 hover:text-zinc-300 transition-colors"
+          >
+            {forgotMode
+              ? 'Back to log in'
+              : authMode === 'signup'
+                ? 'Already have an account? Log in'
+                : 'Need an account? Sign up'}
+          </button>
+        </div>
+      ) : (
+        <>
       {/* ── Hero / Search ── */}
       {phase === 'idle' && (
         <div className="flex-1 flex flex-col items-center justify-center px-4 py-16 animate-fade-up">
@@ -298,13 +923,29 @@ export default function App() {
                 value={query}
                 onChange={e => setQuery(e.target.value)}
                 onKeyDown={e => e.key === 'Enter' && handleSubmit()}
-                placeholder='Search a specific product… "Sony WH-1000XM5 headphones"'
+                placeholder={listening ? 'Listening…' : 'Search a specific product… "Sony WH-1000XM5 headphones"'}
                 className="flex-1 bg-transparent text-white placeholder-zinc-600 text-[15px] pl-12 pr-4 py-4 outline-none"
               />
               <button
+                type="button"
+                onClick={startVoiceSearch}
+                title="Voice search"
+                className="w-9 h-9 rounded-lg flex items-center justify-center transition-all hover:bg-white/5 flex-shrink-0"
+                style={{ color: listening ? '#f43f5e' : '#71717a' }}
+              >
+                <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path
+                    strokeLinecap="round"
+                    strokeLinejoin="round"
+                    strokeWidth={1.8}
+                    d="M12 18.75a6 6 0 006-6v-1.5m-6 7.5a6 6 0 01-6-6v-1.5m6 7.5v3.75m-3.75 0h7.5M12 15.75a3.75 3.75 0 01-3.75-3.75V6a3.75 3.75 0 117.5 0v6a3.75 3.75 0 01-3.75 3.75z"
+                  />
+                </svg>
+              </button>
+              <button
                 onClick={handleSubmit}
                 disabled={!query.trim()}
-                className="m-2 px-5 py-2.5 rounded-xl text-sm font-semibold text-white transition-all disabled:opacity-30"
+                className="m-2 px-5 py-2.5 rounded-xl text-sm font-semibold text-white transition-all hover:brightness-110 hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-30 disabled:hover:translate-y-0 shadow-[0_8px_24px_rgba(99,102,241,0.25)]"
                 style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}
               >
                 Search
@@ -376,8 +1017,38 @@ export default function App() {
         </div>
       )}
 
+      {/* ── Paywall (free trial used up, no active subscription) ── */}
+      {phase === 'results' && paywalled && (
+        <div className="flex-1 flex flex-col items-center justify-center px-4 py-16 text-center animate-fade-up">
+          <div className="w-14 h-14 rounded-2xl flex items-center justify-center mb-5" style={{ background: 'rgba(99,102,241,0.12)' }}>
+            <svg className="w-6 h-6" style={{ color: '#818cf8' }} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+              <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 15v2m-6 4h12a2 2 0 002-2v-6a2 2 0 00-2-2H6a2 2 0 00-2 2v6a2 2 0 002 2zm10-10V7a4 4 0 10-8 0v4h8z" />
+            </svg>
+          </div>
+          <p className="text-white font-semibold mb-2" style={{ fontFamily: 'Sora, sans-serif' }}>You've used all your free searches</p>
+          <p className="text-zinc-500 text-sm max-w-md mb-6">
+            Subscribe for {me?.price_label ?? 'a small monthly fee'} to keep comparing prices with the AI agent.
+          </p>
+          <button
+            onClick={handleSubscribe}
+            disabled={subscribing}
+            className="px-5 py-2.5 rounded-xl text-sm font-semibold text-white transition-all hover:brightness-110 hover:-translate-y-0.5 active:translate-y-0 disabled:opacity-60 disabled:hover:translate-y-0 shadow-[0_8px_24px_rgba(99,102,241,0.25)]"
+            style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}
+          >
+            {subscribing ? (
+              <span className="flex items-center gap-2">
+                <span className="w-3.5 h-3.5 rounded-full border-2 border-white/30 animate-spin" style={{ borderTopColor: '#fff' }} />
+                Starting checkout…
+              </span>
+            ) : (
+              `Subscribe for ${me?.price_label ?? 'a small monthly fee'}`
+            )}
+          </button>
+        </div>
+      )}
+
       {/* ── Error ── */}
-      {phase === 'results' && errorMessage && (
+      {phase === 'results' && errorMessage && !paywalled && (
         <div className="flex-1 flex flex-col items-center justify-center px-4 py-16 text-center animate-fade-up">
           <div className="w-14 h-14 rounded-2xl flex items-center justify-center mb-5" style={{ background: 'rgba(239,68,68,0.12)' }}>
             <svg className="w-6 h-6 text-red-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
@@ -386,7 +1057,11 @@ export default function App() {
           </div>
           <p className="text-white font-semibold mb-2" style={{ fontFamily: 'Sora, sans-serif' }}>Something went wrong</p>
           <p className="text-zinc-500 text-sm max-w-md mb-6">{errorMessage}</p>
-          <button onClick={reset} className="px-5 py-2.5 rounded-xl text-sm font-semibold text-white" style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}>
+          <button
+            onClick={reset}
+            className="px-5 py-2.5 rounded-xl text-sm font-semibold text-white transition-all hover:brightness-110 hover:-translate-y-0.5 active:translate-y-0 shadow-[0_8px_24px_rgba(99,102,241,0.25)]"
+            style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}
+          >
             Try another search
           </button>
         </div>
@@ -412,7 +1087,11 @@ export default function App() {
                 className="flex-1 bg-transparent text-white placeholder-zinc-600 text-sm pl-4 pr-2 py-3 outline-none"
                 placeholder="Add the model, size, or spec…"
               />
-              <button onClick={handleSubmit} className="m-1.5 px-4 py-2 rounded-lg text-xs font-semibold text-white" style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}>
+              <button
+                onClick={handleSubmit}
+                className="m-1.5 px-4 py-2 rounded-lg text-xs font-semibold text-white transition-all hover:brightness-110 active:translate-y-0"
+                style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}
+              >
                 Search again
               </button>
             </div>
@@ -422,7 +1101,7 @@ export default function App() {
       )}
 
       {/* ── Results ── */}
-      {phase === 'results' && !errorMessage && !needsClarification && (
+      {phase === 'results' && !errorMessage && !needsClarification && !paywalled && (
         <div ref={resultsRef} className="flex-1 px-4 sm:px-6 py-6 max-w-7xl mx-auto w-full">
 
           {/* Query bar */}
@@ -506,7 +1185,7 @@ export default function App() {
                 <article
                   key={product.key}
                   onClick={() => setSelected(s => (s?.key === product.key ? null : product))}
-                  className="group rounded-2xl border overflow-hidden cursor-pointer transition-all animate-fade-up"
+                  className="group rounded-2xl border overflow-hidden cursor-pointer transition-all hover:-translate-y-1 hover:shadow-[0_12px_32px_rgba(0,0,0,0.35)] animate-fade-up"
                   style={{
                     background: selected?.key === product.key ? '#0f0f20' : '#0e0e1c',
                     borderColor: selected?.key === product.key ? 'rgba(99,102,241,0.5)' : product.group === 'best' ? 'rgba(16,185,129,0.4)' : 'rgba(255,255,255,0.06)',
@@ -649,7 +1328,7 @@ export default function App() {
                       href={selected.productUrl}
                       target="_blank"
                       rel="noopener noreferrer"
-                      className="block w-full py-3 rounded-xl text-sm font-semibold text-white text-center transition-all"
+                      className="block w-full py-3 rounded-xl text-sm font-semibold text-white text-center transition-all hover:brightness-110 hover:-translate-y-0.5 active:translate-y-0 shadow-[0_8px_24px_rgba(99,102,241,0.25)]"
                       style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}
                     >
                       View on {selected.platform} →
@@ -668,6 +1347,8 @@ export default function App() {
           </div>
         </div>
       )}
+        </>
+      )}
 
       {/* ── Footer ── */}
       <footer className="border-t border-white/5 px-6 py-4">
@@ -676,6 +1357,158 @@ export default function App() {
           <span>This MVP compares prices only - open a listing and use "View on [seller]" to buy directly from them.</span>
         </div>
       </footer>
+
+      {/* ── Account settings modal ── */}
+      {settingsOpen && me && (
+        <div
+          className="fixed inset-0 z-[100] flex items-center justify-center p-4"
+          style={{ background: 'rgba(0,0,0,0.6)' }}
+          onClick={() => setSettingsOpen(false)}
+        >
+          <div
+            className="w-full max-w-lg rounded-2xl border border-white/8 overflow-hidden animate-fade-up max-h-[85vh] overflow-y-auto"
+            style={{ background: '#0e0e1c', boxShadow: '0 20px 60px rgba(0,0,0,0.6)' }}
+            onClick={e => e.stopPropagation()}
+          >
+            <div className="flex items-center justify-between p-5 border-b border-white/5">
+              <h2 className="text-lg font-bold text-white" style={{ fontFamily: 'Sora, sans-serif' }}>
+                Account settings
+              </h2>
+              <button
+                onClick={() => setSettingsOpen(false)}
+                className="w-8 h-8 rounded-lg flex items-center justify-center hover:bg-white/5 transition-colors"
+              >
+                <svg className="w-4 h-4 text-zinc-400" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M6 18L18 6M6 6l12 12" />
+                </svg>
+              </button>
+            </div>
+
+            <div className="p-5 space-y-6">
+              {/* Profile */}
+              <div>
+                <p className="text-[11px] text-zinc-600 uppercase tracking-widest font-semibold mb-3">Profile</p>
+                <div className="rounded-xl border border-white/5 p-4 space-y-1" style={{ background: '#13131f' }}>
+                  <p className="text-sm text-white">{me.email}</p>
+                  <p className="text-xs text-zinc-500">
+                    Member since {new Date(me.member_since).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}
+                  </p>
+                </div>
+              </div>
+
+              {/* Plan */}
+              <div>
+                <p className="text-[11px] text-zinc-600 uppercase tracking-widest font-semibold mb-3">Plan</p>
+                <div className="rounded-xl border border-white/5 p-4" style={{ background: '#13131f' }}>
+                  <p className="text-sm text-white font-semibold mb-1">
+                    {me.subscription_status === 'active'
+                      ? `Subscribed · ${me.price_label}`
+                      : me.subscription_status === 'cancelled'
+                        ? 'Cancelled'
+                        : 'Free trial'}
+                  </p>
+                  <p className="text-xs text-zinc-500 mb-3">
+                    {me.subscription_status === 'active' && me.subscription_renews_at
+                      ? `Renews ${new Date(me.subscription_renews_at).toLocaleDateString('en-IN', { day: 'numeric', month: 'short', year: 'numeric' })}`
+                      : `${Math.max(0, me.free_trial_limit - me.trial_searches_used)} of ${me.free_trial_limit} free searches left`}
+                  </p>
+                  {me.subscription_status === 'active' ? (
+                    <button
+                      onClick={handleCancelSubscription}
+                      disabled={cancelling}
+                      className="text-sm text-red-400 hover:text-red-300 transition-colors disabled:opacity-50"
+                    >
+                      {cancelling ? 'Cancelling…' : 'Cancel subscription'}
+                    </button>
+                  ) : (
+                    <button
+                      onClick={handleSubscribe}
+                      disabled={subscribing}
+                      className="px-4 py-2 rounded-lg text-sm font-semibold text-white transition-all hover:brightness-110 disabled:opacity-50"
+                      style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}
+                    >
+                      {subscribing ? 'Starting checkout…' : `Subscribe for ${me.price_label}`}
+                    </button>
+                  )}
+                </div>
+              </div>
+
+              {/* Change password */}
+              <div>
+                <p className="text-[11px] text-zinc-600 uppercase tracking-widest font-semibold mb-3">Change password</p>
+                <form onSubmit={handleChangePassword} className="space-y-2">
+                  <input
+                    type="password"
+                    required
+                    autoComplete="current-password"
+                    value={currentPassword}
+                    onChange={e => setCurrentPassword(e.target.value)}
+                    placeholder="Current password"
+                    className="w-full rounded-xl border text-white placeholder-zinc-600 text-sm px-4 py-2.5 outline-none transition-shadow focus:shadow-[0_0_0_3px_rgba(99,102,241,0.25)]"
+                    style={{ background: '#13131f', borderColor: 'rgba(255,255,255,0.08)' }}
+                  />
+                  <input
+                    type="password"
+                    required
+                    minLength={8}
+                    autoComplete="new-password"
+                    value={newPassword}
+                    onChange={e => setNewPassword(e.target.value)}
+                    placeholder="New password (min 8 characters)"
+                    className="w-full rounded-xl border text-white placeholder-zinc-600 text-sm px-4 py-2.5 outline-none transition-shadow focus:shadow-[0_0_0_3px_rgba(99,102,241,0.25)]"
+                    style={{ background: '#13131f', borderColor: 'rgba(255,255,255,0.08)' }}
+                  />
+                  {changePasswordError && <p className="text-xs text-red-400">{changePasswordError}</p>}
+                  {changePasswordSuccess && <p className="text-xs text-emerald-400">Password updated.</p>}
+                  <button
+                    type="submit"
+                    disabled={changePasswordSubmitting}
+                    className="px-4 py-2 rounded-lg text-sm font-semibold text-white transition-all hover:brightness-110 disabled:opacity-50"
+                    style={{ background: 'linear-gradient(135deg, #6366f1, #a855f7)' }}
+                  >
+                    {changePasswordSubmitting ? 'Saving…' : 'Update password'}
+                  </button>
+                </form>
+              </div>
+
+              {/* Danger zone */}
+              <div>
+                <p className="text-[11px] uppercase tracking-widest font-semibold mb-3" style={{ color: 'rgba(248,113,113,0.8)' }}>
+                  Danger zone
+                </p>
+                <div className="rounded-xl border p-4" style={{ background: 'rgba(239,68,68,0.06)', borderColor: 'rgba(239,68,68,0.2)' }}>
+                  {!deleteConfirming ? (
+                    <button onClick={() => setDeleteConfirming(true)} className="text-sm text-red-400 hover:text-red-300 transition-colors">
+                      Delete account
+                    </button>
+                  ) : (
+                    <div className="space-y-2">
+                      <p className="text-xs text-zinc-400">
+                        This permanently deletes your account and cancels any active subscription. This can't be undone.
+                      </p>
+                      <div className="flex gap-2">
+                        <button
+                          onClick={handleDeleteAccount}
+                          disabled={deleting}
+                          className="px-4 py-2 rounded-lg text-sm font-semibold text-white bg-red-500 hover:bg-red-600 transition-colors disabled:opacity-50"
+                        >
+                          {deleting ? 'Deleting…' : 'Yes, delete my account'}
+                        </button>
+                        <button
+                          onClick={() => setDeleteConfirming(false)}
+                          className="px-4 py-2 rounded-lg text-sm text-zinc-400 hover:bg-white/5 transition-colors"
+                        >
+                          Cancel
+                        </button>
+                      </div>
+                    </div>
+                  )}
+                </div>
+              </div>
+            </div>
+          </div>
+        </div>
+      )}
     </div>
   )
 }

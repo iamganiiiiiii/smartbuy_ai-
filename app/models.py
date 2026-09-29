@@ -14,6 +14,7 @@ class Listing(BaseModel):
     product_url: str
     thumbnail_url: Optional[str] = None
     fetched_at: str  # ISO timestamp
+    availability: str = "UNKNOWN"  # IN_STOCK | OUT_OF_STOCK | UNKNOWN
 
 
 class AlternativeRecommendation(BaseModel):

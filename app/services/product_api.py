@@ -17,6 +17,7 @@ API shape via the `Listing` model.
 
 import re
 from datetime import datetime, timezone
+from urllib.parse import quote_plus
 
 import httpx
 
@@ -31,6 +32,31 @@ _CURRENCY_SYMBOLS = {
     "€": "EUR",
     "£": "GBP",
 }
+
+# SerpApi's google_shopping product_link/link fields are always a Google
+# shopping-overview page, never the retailer's own site - Google discontinued
+# the API that used to return real per-seller links (confirmed live: the
+# "google_product" engine now returns "The Google Product service is no
+# longer offered by Google"). For the two retailers that dominate Indian
+# Google Shopping results (checked against live samples: Amazon.in + Flipkart
+# were ~34% of results across several sample queries) and whose search-URL
+# pattern is well-established and verified live (200 OK), send the user
+# straight to that retailer's own search instead of through Google. Every
+# other retailer falls back to Google's link below - guessing a URL pattern
+# for an unfamiliar retailer risks a broken link, which is worse than today's
+# one extra click.
+_RETAILER_SEARCH_URL_TEMPLATES = {
+    "amazon": "https://www.amazon.in/s?k={query}",
+    "flipkart": "https://www.flipkart.com/search?q={query}",
+}
+
+
+def _direct_retailer_url(source: str, title: str) -> str | None:
+    source_lower = source.lower()
+    for key, template in _RETAILER_SEARCH_URL_TEMPLATES.items():
+        if key in source_lower:
+            return template.format(query=quote_plus(title))
+    return None
 
 
 class ProductAPIError(RuntimeError):
@@ -65,19 +91,23 @@ def _parse_listing(raw: dict) -> Listing | None:
     amount, currency = _parse_price(raw.get("price"))
     if raw.get("extracted_price") is not None:
         amount = float(raw["extracted_price"])
-    if amount is None:
+    if amount is None or amount <= 0:
         return None
 
     product_url = raw.get("product_link") or raw.get("link")
-    if not product_url:
+    if not product_url or not product_url.startswith(("http://", "https://")):
         return None
+
+    title = raw.get("title", "Unknown product")
+    source = raw.get("source", "Unknown seller")
+    product_url = _direct_retailer_url(source, title) or product_url
 
     product_id = raw.get("product_id") or product_url
 
     return Listing(
         product_id=str(product_id),
-        title=raw.get("title", "Unknown product"),
-        source=raw.get("source", "Unknown seller"),
+        title=title,
+        source=source,
         price=amount,
         currency=currency,
         rating=raw.get("rating"),
@@ -85,6 +115,10 @@ def _parse_listing(raw: dict) -> Listing | None:
         product_url=product_url,
         thumbnail_url=raw.get("thumbnail"),
         fetched_at=datetime.now(timezone.utc).isoformat(),
+        # SerpApi's base google_shopping results don't reliably expose a real
+        # stock-status signal, so UNKNOWN is the honest default (not a stub) -
+        # wire in a real source field here if one is ever confirmed available.
+        availability="UNKNOWN",
     )
 
 

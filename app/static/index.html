@@ -5,19 +5,50 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>SmartBuy AI</title>
   <link rel="stylesheet" href="/static/style.css" />
+  <script src="https://checkout.razorpay.com/v1/checkout.js"></script>
 </head>
 <body>
   <main>
     <h1>SmartBuy AI</h1>
     <p class="subtitle">Best price &amp; best value finder</p>
 
-    <form id="search-form">
-      <input id="query" type="text" placeholder="e.g. Sony WH-1000XM5 headphones" autocomplete="off" required />
-      <button type="submit">Search</button>
-    </form>
+    <section id="auth-view">
+      <form id="signup-form">
+        <input id="signup-email" type="email" placeholder="Email" autocomplete="username" required />
+        <input id="signup-password" type="password" placeholder="Password (min 8 characters)" autocomplete="new-password" required />
+        <button type="submit">Create account</button>
+      </form>
+      <form id="login-form" class="hidden">
+        <input id="login-email" type="email" placeholder="Email" autocomplete="username" required />
+        <input id="login-password" type="password" placeholder="Password" autocomplete="current-password" required />
+        <button type="submit">Log in</button>
+      </form>
+      <p class="muted">
+        <a href="#" id="show-login">Already have an account? Log in</a>
+        <a href="#" id="show-signup" class="hidden">Need an account? Sign up</a>
+      </p>
+      <div id="auth-status"></div>
+    </section>
 
-    <div id="status"></div>
-    <div id="result"></div>
+    <section id="app-view" class="hidden">
+      <div id="account-bar">
+        <span id="account-info"></span>
+        <a href="#" id="logout-link">Log out</a>
+      </div>
+
+      <div id="upgrade-panel" class="hidden">
+        <p>You've used all your free searches.</p>
+        <button id="subscribe-button" type="button">Subscribe to keep searching</button>
+      </div>
+
+      <form id="search-form">
+        <input id="query" type="text" placeholder="e.g. Sony WH-1000XM5 headphones" autocomplete="off" required />
+        <button type="submit">Search</button>
+      </form>
+
+      <div id="status"></div>
+      <div id="result"></div>
+    </section>
   </main>
 
   <script src="/static/app.js"></script>

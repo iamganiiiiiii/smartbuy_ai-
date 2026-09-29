@@ -14,6 +14,7 @@ Two tools, matching the TRD's agent workflow:
   not just "different".
 """
 
+from app import guardrails
 from app.models import Listing
 from app.services import product_api, ranking, relevance
 from app.services.cache import search_cache
@@ -33,7 +34,19 @@ TOOL_SCHEMAS = [
                 "query": {
                     "type": "string",
                     "description": "The product to search for, as specific as possible (include storage/size/color/model if the user gave it).",
-                }
+                },
+                "max_price": {
+                    "type": "number",
+                    "description": (
+                        "The user's stated maximum budget, as a plain number (convert shorthand: "
+                        "'60k' -> 60000, '1.2 lakh' -> 120000). Omit if the user gave no budget - "
+                        "never guess one."
+                    ),
+                },
+                "max_price_currency": {
+                    "type": "string",
+                    "description": "Currency of max_price (e.g. INR, USD). Required if max_price is given.",
+                },
             },
             "required": ["query"],
         },
@@ -69,13 +82,13 @@ TOOL_SCHEMAS = [
 
 async def dispatch(name: str, tool_input: dict) -> dict:
     if name == "search_products":
-        return await _search_products(tool_input["query"])
+        return await _search_products(tool_input["query"], tool_input.get("max_price"), tool_input.get("max_price_currency"))
     if name == "find_alternatives":
         return await _find_alternatives(tool_input)
     return {"error": f"Unknown tool: {name}"}
 
 
-async def _search_products(query: str) -> dict:
+async def _search_products(query: str, max_price: float | None = None, max_price_currency: str | None = None) -> dict:
     cache_key = f"search:{query.lower().strip()}"
     listings = search_cache.get(cache_key)
     if listings is None:
@@ -103,6 +116,22 @@ async def _search_products(query: str) -> dict:
             "other_listings": [],
         }
     listings = relevant
+
+    # Budget is a hard constraint enforced in code, not a hint the model might
+    # or might not respect - filter before ranking so an over-budget item can
+    # never become "best_listing".
+    if max_price is not None:
+        in_budget = guardrails.filter_by_max_price(listings, max_price, max_price_currency)
+        if not in_budget and listings:
+            return {
+                "query": query,
+                "listing_count": 0,
+                "warning": f"No results found under the stated budget of {max_price_currency or ''} {max_price:g}.".strip(),
+                "best_listing": None,
+                "other_listings": [],
+                "flags": ["budget_filtered_empty"],
+            }
+        listings = in_budget
 
     best = ranking.pick_best_listing(listings)
     others = [l for l in listings if best and l.product_id != best.product_id]

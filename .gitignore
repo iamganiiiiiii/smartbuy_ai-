@@ -10,6 +10,12 @@ __pycache__/
 # Stray debug/log output from local runs
 *.log
 
+# SQLite user/subscription database (local state, not project source)
+app/data/
+*.db
+
 # Node/Vite frontend (react-ui/) build & dependency output
 react-ui/node_modules/
 react-ui/dist/
+
+.databricks

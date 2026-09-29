@@ -196,6 +196,49 @@ button:disabled { opacity: 0.6; cursor: default; }
 
 .muted { color: var(--muted); }
 
+.hidden { display: none !important; }
+
+#signup-form, #login-form {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  max-width: 320px;
+}
+
+#signup-form input, #login-form input {
+  padding: 12px 14px;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: var(--panel);
+  color: var(--text);
+  font-size: 15px;
+}
+
+#auth-status { color: #d64545; font-size: 14px; margin-top: 10px; }
+
+#account-bar {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-size: 13px;
+  color: var(--muted);
+  margin-bottom: 20px;
+}
+#account-bar a { color: var(--accent); }
+
+#upgrade-panel {
+  background: var(--panel);
+  border: 1px solid var(--accent);
+  border-radius: 10px;
+  padding: 16px 20px;
+  margin-bottom: 20px;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 12px;
+  flex-wrap: wrap;
+}
+
 .trace {
   margin-top: 16px;
   font-size: 12px;
